@@ -224,6 +224,25 @@ pub fn open_mac_os_screen_recording_settings() -> Result<(), DriverError> {
     }
 }
 
+/// Start the agent-cursor overlay in a macOS host that runs its own AppKit
+/// event loop.
+///
+/// A runtime created with [`CuaDriver::try_create_configured_for_host`] and an
+/// enabled cursor prepares the overlay but draws nothing until a main thread
+/// serves it. The standalone daemon gives it the whole thread; an application
+/// that already runs `NSApplication` calls this once on its main thread
+/// instead, after creating the runtime. It returns at once and leaves the
+/// host's activation policy and run loop alone. Until it is called, cursor
+/// motion is skipped and actions are delivered without it.
+#[cfg(target_os = "macos")]
+pub fn attach_mac_os_cursor_overlay() -> Result<(), DriverError> {
+    platform_macos::cursor::overlay::attach_to_running_application().map_err(|error| {
+        DriverError::Configuration {
+            reason: format!("attach cursor overlay: {error}"),
+        }
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn mac_os_accessibility_granted() -> bool {
     #[link(name = "ApplicationServices", kind = "framework")]

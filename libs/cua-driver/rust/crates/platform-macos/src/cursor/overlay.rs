@@ -89,7 +89,7 @@ static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 static OVERLAY_WINDOW_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static DISPLAY_LAYOUT: Mutex<Option<super::display_layout::DisplayLayout>> = Mutex::new(None);
 /// True while the render loop that fires arrival signals runs. Only
-/// [`run_on_main_thread`] (through `run_appkit`) starts it: a host that
+/// [`run_on_main_thread`] and [`attach_to_running_application`] start it: a host that
 /// initializes the overlay but never hands it the main thread has no one to
 /// fire an arrival, so [`animate_cursor_to`] must not wait for one.
 static RENDER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -1004,8 +1004,24 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // Finish launching without presenting a UI (needed for NSApp.run())
     let _: () = msg_send![app, finishLaunching];
 
-    let Ok(layout) = super::display_layout::active_layout(0) else {
+    if !start_render_loop(rx) {
         return;
+    }
+
+    // ---- NSApplication run loop (blocks until process exits) ----
+    let _: () = msg_send![app, run];
+    OVERLAY_WINDOW_IDS.lock().unwrap().clear();
+}
+
+/// Create the overlay windows and start the thread that animates them.
+/// False when the display layout cannot be read, in which case nothing starts.
+///
+/// # Safety
+///
+/// Must run on the main thread of a process that has an `NSApplication`.
+unsafe fn start_render_loop(rx: std::sync::mpsc::Receiver<OverlayMsg>) -> bool {
+    let Ok(layout) = super::display_layout::active_layout(0) else {
+        return false;
     };
     let surfaces = rebuild_surfaces(&layout, Vec::new());
     RENDER_LOOP_RUNNING.store(true, Ordering::Release);
@@ -1015,10 +1031,70 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     });
 
     install_activation_repin_observer();
+    true
+}
 
-    // ---- NSApplication run loop (blocks until process exits) ----
-    let _: () = msg_send![app, run];
-    OVERLAY_WINDOW_IDS.lock().unwrap().clear();
+/// Why [`attach_to_running_application`] did not start the overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachError {
+    /// The caller is not on the main thread, where AppKit creates windows.
+    NotMainThread,
+    /// No runtime initialized the overlay, it is disabled, or it already runs.
+    NotInitialized,
+    /// The process has no Window Server session to draw in.
+    NoGraphicSession,
+    /// The display layout could not be read.
+    DisplayLayoutUnavailable,
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotMainThread => "the cursor overlay must attach on the main thread",
+            Self::NotInitialized => {
+                "the cursor overlay is disabled, not initialized, or already running"
+            }
+            Self::NoGraphicSession => "the process has no Window Server session",
+            Self::DisplayLayoutUnavailable => "the display layout could not be read",
+        })
+    }
+}
+
+impl std::error::Error for AttachError {}
+
+/// Start the overlay in an application that runs its own AppKit event loop.
+///
+/// The counterpart of [`run_on_main_thread`] for an embedding host: it
+/// creates the overlay windows and the render thread and returns, leaving the
+/// host's `NSApplication`, activation policy and run loop untouched. Call it
+/// once on the main thread, after a runtime created with an enabled cursor
+/// has called [`init`]. The overlay then lives as long as the process.
+pub fn attach_to_running_application() -> Result<(), AttachError> {
+    if objc2_foundation::MainThreadMarker::new().is_none() {
+        return Err(AttachError::NotMainThread);
+    }
+    let enabled = RENDER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|map| map.template.enabled);
+    if !enabled {
+        return Err(AttachError::NotInitialized);
+    }
+    if !crate::session::has_graphic_access() {
+        return Err(AttachError::NoGraphicSession);
+    }
+    let Some(rx) = CMD_RX_CELL.lock().unwrap().take() else {
+        return Err(AttachError::NotInitialized);
+    };
+    crate::input::input_source::main_thread_runs_event_loop();
+    // SAFETY: on the main thread, checked above, of a host that owns an
+    // `NSApplication`.
+    if unsafe { start_render_loop(rx) } {
+        Ok(())
+    } else {
+        Err(AttachError::DisplayLayoutUnavailable)
+    }
 }
 
 fn render_loop(

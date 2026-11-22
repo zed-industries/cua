@@ -70,6 +70,15 @@ runtime. Until a host installs a certified main-thread UI adapter, overlay
 methods return structured `facility_unavailable` results. Use the private
 worker or daemon-backed host when the visible overlay is required.
 
+A Rust host that already runs AppKit's event loop can show the overlay from
+its own process. Create the runtime with
+`CuaDriver::try_create_configured_for_host` and an enabled `CursorConfig`, then
+call `cua_driver_sdk::attach_mac_os_cursor_overlay()` once on the main thread.
+It creates the overlay windows and the render thread and returns. Unlike the
+standalone daemon's `run_on_main_thread`, it does not change the application's
+activation policy or run a loop of its own, so the host keeps its Dock icon,
+menu bar and focus behavior.
+
 Use the daemon-backed host below only when the application must also provide a
 stable MCP endpoint to an external agent, coordinate external clients, or keep
 the automation runtime isolated from the application process.
