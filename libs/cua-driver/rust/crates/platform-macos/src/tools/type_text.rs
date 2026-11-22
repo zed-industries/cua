@@ -386,7 +386,7 @@ impl Tool for TypeTextTool {
         // helper windows. Wrap so callers see them in the result suffix
         // and the wildcard suppressor catches reflex activations.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
 
         // Terminal-emulator short-circuit: when the target pid belongs
         // to a known terminal (Ghostty / Terminal.app / iTerm2 / …), the
@@ -403,7 +403,7 @@ impl Tool for TypeTextTool {
             prior_front,
             "type_text.AXSelectedText",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                crate::input::blocking_input(move || {
                     let _native_guard = native_guard;
                     type_text_blocking(
                         pid,

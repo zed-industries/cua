@@ -240,7 +240,7 @@ pub fn type_text_while(
     let mut sent = 0;
     if inter_char_delay_ms == 0 {
         for chunk in plan_chunks(text) {
-            if !may_send() {
+            if super::input_cancelled() || !may_send() {
                 return Ok(sent);
             }
             let (down, up, chars) = match chunk {
@@ -263,7 +263,7 @@ pub fn type_text_while(
     }
 
     for ch in text.chars() {
-        if !may_send() {
+        if super::input_cancelled() || !may_send() {
             return Ok(sent);
         }
         let (down, up) = char_key_events(&source, ch)?;

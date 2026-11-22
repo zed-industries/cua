@@ -473,6 +473,7 @@ fn click_at_xy_inner(
         std::thread::sleep(cua_driver_core::input_pacing::mouse_primer_settle());
 
         for pair_index in 0..count {
+            anyhow::ensure!(!super::input_cancelled(), "click cancelled");
             let click_state = (pair_index + 1) as i64;
 
             let down = CGEvent::new_mouse_event(
@@ -774,6 +775,10 @@ pub fn click_at_xy_chromium(
     };
 
     for step in route_plan {
+        anyhow::ensure!(
+            matches!(step.kind, ChromiumClickEventKind::Up) || !super::input_cancelled(),
+            "click cancelled"
+        );
         let (event_type, error_label) = match step.kind {
             ChromiumClickEventKind::Move => (CGEventType::MouseMoved, "mouseMoved"),
             ChromiumClickEventKind::Down if step.phase == 1 => {
@@ -1070,7 +1075,17 @@ where
         (0.0, 0.0)
     };
     let mut session: Option<bool> = None;
-    for step in background_drag_plan(from, to, steps, duration_ms) {
+    let mut held = None;
+    for mut step in background_drag_plan(from, to, steps, duration_ms) {
+        let cancelled = super::input_cancelled();
+        if cancelled {
+            let Some((release, point)) = held else {
+                anyhow::bail!("drag cancelled");
+            };
+            // Release at the last delivered location, not the planned drop point.
+            step.kind = release;
+            step.point = point;
+        }
         if session.is_some() && step.kind == Dragged {
             continue;
         }
@@ -1116,6 +1131,14 @@ where
             Ok(())
         };
         post(step.point)?;
+        if cancelled {
+            anyhow::bail!("drag cancelled");
+        }
+        held = match step.kind {
+            PrimerDown => Some((PrimerUp, step.point)),
+            Down | Dragged => Some((Up, step.point)),
+            _ => None,
+        };
         if matches!(step.kind, Down | Dragged) {
             observe(step.point.0, step.point.1);
         }
@@ -1130,7 +1153,7 @@ where
         let step_end =
             std::time::Instant::now() + std::time::Duration::from_millis(step.delay_after_ms);
         let mut open = session_open();
-        while !open && std::time::Instant::now() < step_end {
+        while !open && !super::input_cancelled() && std::time::Instant::now() < step_end {
             let left = step_end.saturating_duration_since(std::time::Instant::now());
             std::thread::sleep(left.min(DRAG_SESSION_POLL));
             open = session_open();
@@ -1140,8 +1163,9 @@ where
             observe(to.0, to.1);
             let deadline = std::time::Instant::now() + DRAG_SESSION_HOLD;
             let mut ended = false;
-            while std::time::Instant::now() < deadline {
+            while !super::input_cancelled() && std::time::Instant::now() < deadline {
                 post(to)?;
+                held = Some((Up, to));
                 std::thread::sleep(std::time::Duration::from_millis(DRAG_SESSION_TICK_MS));
                 if !session_open() {
                     ended = true;
@@ -1830,6 +1854,7 @@ pub fn scroll_wheel_at_xy(
 
     for _ in 0..ticks.max(1) {
         // Fresh source per event, matching the click primitives.
+        anyhow::ensure!(!super::input_cancelled(), "scroll cancelled");
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
         // wheel_count = 2 → both axes carried (vertical = wheel1/axis-1,
@@ -2588,6 +2613,58 @@ mod tests {
             .iter()
             .all(|flags| *flags == 0x0002_0000));
         assert_eq!(observed, [(100.0, 100.0), (150.0, 100.0), (200.0, 100.0)]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_drag_releases_at_last_delivered_point() {
+        let (started, down) = tokio::sync::oneshot::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let (finished, result) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(crate::input::blocking_input(move || {
+            let mut started = Some(started);
+            let capture = Capture::start(true);
+            let dragged = drag_at_xy_background(
+                42,
+                (100., 100.),
+                (200., 100.),
+                (0., 0.),
+                7,
+                1,
+                2,
+                &[],
+                DragButton::Left,
+                |_, _| {
+                    if let Some(started) = started.take() {
+                        started.send(()).unwrap();
+                        wait.recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    }
+                },
+                || false,
+            );
+            let events: Vec<_> = capture
+                .posted()
+                .iter()
+                .map(|event| event.event.clone())
+                .collect();
+            finished.send((dragged.is_err(), events)).unwrap();
+        }));
+        down.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        resume.send(()).unwrap();
+        let (cancelled, events) = result.await.unwrap();
+        assert!(cancelled);
+        assert_eq!(
+            events,
+            [
+                "MouseMoved",
+                "LeftMouseDown",
+                "LeftMouseUp",
+                "LeftMouseDown",
+                "LeftMouseUp"
+            ]
+        );
     }
 
     #[test]

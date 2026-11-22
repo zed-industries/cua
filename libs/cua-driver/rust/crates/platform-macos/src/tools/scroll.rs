@@ -250,7 +250,7 @@ impl Tool for ScrollTool {
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
                 let ax_result =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
+                    crate::input::blocking_input(move || -> anyhow::Result<(bool, bool)> {
                         if foreground {
                             let mut delivered = false;
                             let fronted = crate::input::skylight::with_foreground_assist(
@@ -542,7 +542,7 @@ impl Tool for ScrollTool {
             );
 
             let prior_front = apps::frontmost_pid();
-            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
 
             let WheelTarget {
                 screen_x,
@@ -558,7 +558,7 @@ impl Tool for ScrollTool {
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    crate::input::blocking_input(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
@@ -659,7 +659,7 @@ impl Tool for ScrollTool {
         // any reflex activations it triggers are caught by both the wildcard
         // snapshot suppressor and the targeted FocusGuard lease.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
 
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
@@ -676,8 +676,9 @@ impl Tool for ScrollTool {
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
-                tokio::task::spawn_blocking(move || {
+                crate::input::blocking_input(move || {
                     for _ in 0..amount {
+                        anyhow::ensure!(!crate::input::input_cancelled(), "scroll cancelled");
                         crate::input::keyboard::press_key(pid, &key, &[])?;
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
@@ -759,7 +760,7 @@ async fn electron_reveal_scroll(
     }
     let window_rect = window.map(|b| [b.x, b.y, b.width, b.height]);
     let direction_owned = direction.to_owned();
-    let outcome = tokio::task::spawn_blocking(move || unsafe {
+    let outcome = crate::input::blocking_input(move || unsafe {
         crate::ax::reveal_scroll::reveal_scroll(pid, point, window_rect, &direction_owned, distance)
     })
     .await;
@@ -812,7 +813,9 @@ unsafe fn scroll_native_text_area(
     let mut delivered = false;
     if let Some(target) = buttons.get(index).copied() {
         for _ in 0..amount.max(1) {
-            if perform_action(target, "AXPress") != kAXErrorSuccess {
+            if crate::input::input_cancelled()
+                || perform_action(target, "AXPress") != kAXErrorSuccess
+            {
                 break;
             }
             delivered = true;

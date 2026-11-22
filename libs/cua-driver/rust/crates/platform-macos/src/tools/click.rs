@@ -1115,9 +1115,9 @@ impl ClickTool {
             let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
             let snapshot = if foreground {
-                WindowChangeDetector::snapshot_without_suppression(prior_front)
+                WindowChangeDetector::snapshot_without_suppression(prior_front, pid)
             } else {
-                WindowChangeDetector::snapshot(prior_front)
+                WindowChangeDetector::snapshot(prior_front, pid)
             };
 
             // Run AX work on a blocking thread (can't block async executor).
@@ -1137,7 +1137,8 @@ impl ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::input::blocking_input(move || {
+                        anyhow::ensure!(!crate::input::input_cancelled(), "click cancelled");
                         let element_ptr = element_guard.as_ptr();
                         if foreground {
                             let mut outcome = None;
@@ -1657,13 +1658,13 @@ impl ClickTool {
             let undo = crate::focus_arbiter::UndoWatch::arm();
             let snapshot = match activation_policy {
                 PixelActivationPolicy::SuppressTarget => {
-                    WindowChangeDetector::snapshot(prior_front)
+                    WindowChangeDetector::snapshot(prior_front, pid)
                 }
                 PixelActivationPolicy::AllowTargetWithoutRaise => {
                     WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
                 }
                 PixelActivationPolicy::ForegroundAssist => {
-                    WindowChangeDetector::snapshot_without_suppression(prior_front)
+                    WindowChangeDetector::snapshot_without_suppression(prior_front, pid)
                 }
             };
 
@@ -1755,8 +1756,9 @@ impl ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::input::blocking_input(move || {
                         let do_click = move || -> anyhow::Result<()> {
+                            anyhow::ensure!(!crate::input::input_cancelled(), "click cancelled");
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if let (PixelClickRoute::BackgroundAppKitActivated, Some(wid)) =
                                 (route, window_id)

@@ -40,6 +40,13 @@ tokio::task_local! {
     static DISPATCH_RUNTIME_SCOPE: String;
     /// The physical desktop action this task dispatches.
     static DESKTOP_LEASE: DesktopLease;
+    /// Private, namespaced lifecycle identity of the current invocation.
+    static ACTION_SESSION: Option<String>;
+}
+
+/// Identifies the session to which delayed platform observations may be returned.
+pub fn action_session() -> Option<String> {
+    ACTION_SESSION.try_with(Clone::clone).ok().flatten()
 }
 
 /// Return the immutable authorization context bound to the current dispatch.
@@ -2690,7 +2697,7 @@ impl ToolRegistry {
             crate::security_prompt::PromptInput::for_mode(context.mode()).stamp(&mut args);
         }
         crate::tool_activity::note_tool_activity();
-        let invoke = tool.invoke(args.clone());
+        let invoke = ACTION_SESSION.scope(runtime_session.clone(), tool.invoke(args.clone()));
         let mut result =
             crate::recording::scope_dispatch_click_capture(pending_turn.as_ref(), async {
                 match (&input_admission.desktop, lane_refusal) {

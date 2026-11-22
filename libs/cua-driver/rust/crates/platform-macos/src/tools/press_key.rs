@@ -474,7 +474,7 @@ impl Tool for PressKeyTool {
         // so any reflex activations it triggers are caught by both the
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
         let prompt = PromptInput::from_args(&args);
 
         let result = focus_guard::with_focus_suppressed(

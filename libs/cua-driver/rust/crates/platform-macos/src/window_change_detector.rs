@@ -29,7 +29,7 @@
 //! // pid to restore to — avoids a race where another app activates
 //! // between the caller's `frontmost_pid()` and the detector's own.
 //! let prior_front = apps::frontmost_pid();
-//! let snapshot = WindowChangeDetector::snapshot(prior_front);
+//! let snapshot = WindowChangeDetector::snapshot(prior_front, target_pid);
 //! // … perform action …
 //! let changes = snapshot.detect();
 //! // changes.result_suffix() — append to ToolResult text.
@@ -75,6 +75,8 @@ pub struct WindowEvent {
 ///   ends suppression. Held inside `Option` so `detect()` can take it
 ///   and drop early.
 pub struct Snapshot {
+    target_pid: i32,
+    reports: Option<ReportSlot>,
     window_ids: HashSet<u32>,
     front_pid: Option<i32>,
     _lease: Option<SuppressionLease>,
@@ -267,22 +269,35 @@ const LATE_REPORT_MAX_AGE: Duration = Duration::from_secs(10);
 /// A change a detached tail saw after its action had returned.
 #[derive(Debug, Clone)]
 struct Late {
+    target_pid: i32,
     at: Instant,
     new_windows: Vec<WindowEvent>,
     foreground_changed: bool,
 }
 
-static LATE: Mutex<Option<Late>> = Mutex::new(None);
+type ReportSlot = std::sync::Arc<Mutex<Option<Late>>>;
+
+fn report_slot(session: &str) -> ReportSlot {
+    static SLOTS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, ReportSlot>>> =
+        std::sync::LazyLock::new(Default::default);
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        cua_driver_core::session::register_session_end_hook(|session| {
+            lock(&SLOTS).remove(session);
+        })
+    });
+    lock(&SLOTS).entry(session.to_owned()).or_default().clone()
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Take a late change recorded by a detached tail, if it is recent.
-fn take_late() -> Option<Late> {
-    lock(&LATE)
+fn take_late(slot: &Mutex<Option<Late>>, target_pid: i32) -> Option<Late> {
+    lock(slot)
         .take()
-        .filter(|late| late.at.elapsed() <= LATE_REPORT_MAX_AGE)
+        .filter(|late| late.target_pid == target_pid && late.at.elapsed() <= LATE_REPORT_MAX_AGE)
 }
 
 /// Resolve the post-action observation bounds from raw host values against
@@ -333,15 +348,15 @@ impl WindowChangeDetector {
     ///
     /// Safe to call from any thread — `CGWindowListCopyWindowInfo` is
     /// documented as thread-safe.
-    pub fn snapshot(prior_front: Option<i32>) -> Snapshot {
-        Self::capture(prior_front, true, None)
+    pub fn snapshot(prior_front: Option<i32>, target_pid: i32) -> Snapshot {
+        Self::capture(prior_front, true, None, target_pid)
     }
 
     /// Capture the same before-state without arming reactive focus suppression.
     /// Foreground delivery owns its temporary activation and restoration, so a
     /// wildcard lease would race the target while the action is settling.
-    pub fn snapshot_without_suppression(prior_front: Option<i32>) -> Snapshot {
-        Self::capture(prior_front, false, None)
+    pub fn snapshot_without_suppression(prior_front: Option<i32>, target_pid: i32) -> Snapshot {
+        Self::capture(prior_front, false, None, target_pid)
     }
 
     /// Capture the before-state and suppress cross-app activations while
@@ -352,28 +367,41 @@ impl WindowChangeDetector {
     /// accepts the click, but a link or hand-off that activates a different app
     /// must still restore the user's original foreground.
     pub fn snapshot_allowing_activation(prior_front: Option<i32>, allowed_pid: i32) -> Snapshot {
-        Self::capture(prior_front, true, Some(allowed_pid))
+        Self::capture(prior_front, true, Some(allowed_pid), allowed_pid)
     }
 
     fn capture(
         prior_front: Option<i32>,
         suppress_focus: bool,
         allowed_pid: Option<i32>,
+        target_pid: i32,
     ) -> Snapshot {
         // A new action supersedes the previous action's detached observation.
         focus_arbiter::end_detached();
         let window_ids: HashSet<u32> = host_windows().into_iter().map(|w| w.window_id).collect();
-        let mut snapshot = Self::capture_from(window_ids, prior_front, suppress_focus, allowed_pid);
-        snapshot.earlier = take_late();
+        let mut snapshot = Self::capture_scoped(
+            window_ids,
+            prior_front,
+            suppress_focus,
+            allowed_pid,
+            target_pid,
+            cua_driver_core::tool::action_session(),
+        );
+        snapshot.earlier = snapshot
+            .reports
+            .as_deref()
+            .and_then(|slot| take_late(slot, target_pid));
         snapshot
     }
 
     /// `capture` over an already-read window set.
-    fn capture_from(
+    fn capture_scoped(
         window_ids: HashSet<u32>,
         prior_front: Option<i32>,
         suppress_focus: bool,
         allowed_pid: Option<i32>,
+        target_pid: i32,
+        session: Option<String>,
     ) -> Snapshot {
         // Arm wildcard suppression — covers snapshot → detect window.
         // restore_to = caller-captured frontmost; target = wildcard
@@ -396,11 +424,30 @@ impl WindowChangeDetector {
             });
 
         Snapshot {
+            target_pid,
+            reports: session.as_deref().map(report_slot),
             window_ids,
             front_pid: prior_front,
             _lease: lease,
             earlier: None,
         }
+    }
+
+    #[cfg(test)]
+    fn capture_from(
+        window_ids: HashSet<u32>,
+        prior_front: Option<i32>,
+        suppress_focus: bool,
+        allowed_pid: Option<i32>,
+    ) -> Snapshot {
+        Self::capture_scoped(
+            window_ids,
+            prior_front,
+            suppress_focus,
+            allowed_pid,
+            7,
+            Some("test-session".into()),
+        )
     }
 }
 
@@ -550,7 +597,8 @@ impl Snapshot {
         let (current, current_front) = observe();
         // Keep the live detector and the pure regression tests on the same
         // diff path so daemon-window filtering cannot drift between them.
-        let (new_windows, _closed) = Self::diff(&self.window_ids, &current);
+        let (mut new_windows, _closed) = Self::diff(&self.window_ids, &current);
+        new_windows.retain(|window| window.pid == self.target_pid);
         let foreground_changed = match (self.front_pid, current_front) {
             (Some(orig), Some(cur)) => orig != cur,
             _ => false,
@@ -611,11 +659,14 @@ impl Snapshot {
                         if !still_mine() {
                             return;
                         }
-                        *lock(&LATE) = Some(Late {
-                            at: Instant::now(),
-                            new_windows: changes.new_windows,
-                            foreground_changed: changes.foreground_changed,
-                        });
+                        if let Some(slot) = &self.reports {
+                            *lock(slot) = Some(Late {
+                                target_pid: self.target_pid,
+                                at: Instant::now(),
+                                new_windows: changes.new_windows,
+                                foreground_changed: changes.foreground_changed,
+                            });
+                        }
                         // Keep the lease until the deadline: the change may be
                         // an activation it is still reverting.
                         break;
@@ -973,7 +1024,11 @@ mod tests {
         let changes =
             snap.detect_bounded_with(observation_bounds_from(Some("1000"), Some("1")), || {
                 (
-                    vec![win(1, 7, "App", "Main"), win(2, 8, "Other", "Popup")],
+                    vec![
+                        win(1, 7, "App", "Main"),
+                        win(2, 7, "App", "Popup"),
+                        win(3, 8, "Other", "Private"),
+                    ],
                     Some(8),
                 )
             });
@@ -1149,7 +1204,8 @@ mod tests {
     fn a_skipped_wait_returns_at_once_and_watches_detached() {
         let _serial = lock(&TAIL_TEST_LOCK);
         focus_arbiter::end_detached();
-        lock(&LATE).take();
+        let slot = report_slot("test-session");
+        lock(&slot).take();
         let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_opened = opened.clone();
         let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
@@ -1179,11 +1235,11 @@ mod tests {
         assert!(focus_arbiter::has_detached(), "the deadline runs detached");
         opened.store(true, Ordering::SeqCst);
         let wait_until = Instant::now() + Duration::from_secs(2);
-        while lock(&LATE).is_none() && Instant::now() < wait_until {
+        while lock(&slot).is_none() && Instant::now() < wait_until {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            take_late().is_some_and(|late| late.new_windows.len() == 1),
+            take_late(&slot, 7).is_some_and(|late| late.new_windows.len() == 1),
             "the detached watch records the late window"
         );
         focus_arbiter::end_detached();
@@ -1261,7 +1317,8 @@ mod tests {
     fn a_late_window_is_reported_on_the_next_result() {
         let _serial = lock(&TAIL_TEST_LOCK);
         focus_arbiter::end_detached();
-        lock(&LATE).take();
+        let slot = report_slot("test-session");
+        lock(&slot).take();
         let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_opened = opened.clone();
         let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
@@ -1281,13 +1338,14 @@ mod tests {
         assert!(!first.needs_restore());
         opened.store(true, Ordering::SeqCst);
         let wait_until = Instant::now() + Duration::from_secs(2);
-        while lock(&LATE).is_none() && Instant::now() < wait_until {
+        while lock(&slot).is_none() && Instant::now() < wait_until {
             std::thread::sleep(Duration::from_millis(10));
         }
         let mut next =
             WindowChangeDetector::capture_from(HashSet::from([1, 2]), Some(7), false, None);
         focus_arbiter::end_detached();
-        next.earlier = take_late();
+        assert!(take_late(&report_slot("separate-session"), 7).is_none());
+        next.earlier = take_late(&slot, 7);
         let second = next.detect_bounded_with(observation_bounds_from(Some("0"), None), || {
             panic!("a zero timeout must not observe the host")
         });
@@ -1295,7 +1353,7 @@ mod tests {
             second.result_suffix(),
             "\n\n🪟 After the previous action returned, it opened new window(s): App (\"Save\")."
         );
-        assert!(take_late().is_none(), "reported once");
+        assert!(take_late(&slot, 7).is_none(), "reported once");
     }
 
     /// The next action ends the previous tail before it acts, so a lingering
@@ -1304,7 +1362,8 @@ mod tests {
     fn end_detached_stops_the_detached_observation() {
         let _serial = lock(&TAIL_TEST_LOCK);
         focus_arbiter::end_detached();
-        lock(&LATE).take();
+        let slot = report_slot("test-session");
+        lock(&slot).take();
         let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
         let observations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = observations.clone();
@@ -1320,6 +1379,6 @@ mod tests {
         let after_end = observations.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(observations.load(Ordering::SeqCst), after_end);
-        assert!(lock(&LATE).is_none());
+        assert!(lock(&slot).is_none());
     }
 }

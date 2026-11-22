@@ -249,7 +249,7 @@ impl Tool for SetValueTool {
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
         // child option which can trigger app activation in some setups.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
         let settle_guard = element_guard.clone();
 
         let result = focus_guard::with_focus_suppressed(
@@ -374,7 +374,7 @@ async fn calc_set_value(
         Err(refusal) => return refusal,
     };
     let prior_front = apps::frontmost_pid();
-    let snapshot = WindowChangeDetector::snapshot(prior_front);
+    let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
     let typed_address = address.clone();
     let result = focus_guard::with_focus_suppressed(
         Some(pid),

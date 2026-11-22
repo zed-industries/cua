@@ -22,6 +22,36 @@ pub mod mouse;
 pub mod pointer_toolkit;
 pub mod skylight;
 
+thread_local! {
+    /// A blocking worker is not cancelled when its Tokio join handle drops.
+    static INPUT_CALL: std::cell::RefCell<Option<std::sync::Weak<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) async fn blocking_input<T: Send + 'static>(
+    action: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let owner = std::sync::Arc::new(());
+    let permission = std::sync::Arc::downgrade(&owner);
+    let result = tokio::task::spawn_blocking(move || {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                INPUT_CALL.set(None);
+            }
+        }
+        let _clear = Clear;
+        INPUT_CALL.set(Some(permission));
+        action()
+    })
+    .await;
+    drop(owner);
+    result
+}
+
+pub(super) fn input_cancelled() -> bool {
+    INPUT_CALL.with_borrow(|call| call.as_ref().is_some_and(|owner| owner.strong_count() == 0))
+}
+
 pub use ax_actions::perform_ax_action;
 pub use interactive::{
     GesturePhase, InteractiveDeliveryMode, InteractiveInputBatch, InteractiveInputConfig,

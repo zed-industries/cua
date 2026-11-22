@@ -383,6 +383,10 @@ pub fn click(
     count: usize,
 ) -> anyhow::Result<()> {
     for event in click_plan(local, window_height, count) {
+        anyhow::ensure!(
+            matches!(event.kind, MouseKind::LeftUp) || !super::input_cancelled(),
+            "click cancelled"
+        );
         post_ns_mouse_event(pid, window_id, screen, event)?;
         std::thread::sleep(EVENT_GAP);
     }

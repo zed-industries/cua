@@ -341,6 +341,11 @@ impl Tool for DragTool {
             // the app's main process instead, where the held button is part
             // of the event; refuse when that route is unavailable.
             if crate::browser::ElectronJs::is_electron(pid) {
+                if self.state.host_owns_permission_ux {
+                    // Once submitted, the Electron main-process program outlives
+                    // its SDK call; a supervised host cannot stop the gesture.
+                    return ToolResult::error("Background Electron drag cannot be cancelled by the embedding application.");
+                }
                 return self
                     .electron_background_drag(
                         &cursor_key,
@@ -374,7 +379,7 @@ impl Tool for DragTool {
         let prior_front = apps::frontmost_pid();
         let undo = crate::focus_arbiter::UndoWatch::arm();
         let snapshot = if fg {
-            WindowChangeDetector::snapshot(prior_front)
+            WindowChangeDetector::snapshot(prior_front, pid)
         } else {
             WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
         };
@@ -441,7 +446,7 @@ impl Tool for DragTool {
             prior_front,
             "drag.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<BackgroundDrag> {
+                crate::input::blocking_input(move || -> anyhow::Result<BackgroundDrag> {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     let observe = move |x: f64, y: f64| {
                         crate::cursor::overlay::send_command(

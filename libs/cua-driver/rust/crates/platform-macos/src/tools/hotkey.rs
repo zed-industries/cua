@@ -596,7 +596,7 @@ impl Tool for HotkeyTool {
         // suppressor — wrapping ensures both side-effects are observed
         // and the prior frontmost is restored if the activation lingers.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot(prior_front, pid);
         let prompt = PromptInput::from_args(&args);
 
         let result = focus_guard::with_focus_suppressed(

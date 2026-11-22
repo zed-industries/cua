@@ -148,9 +148,10 @@ impl Tool for DoubleClickTool {
             let snapshot = if foreground {
                 crate::window_change_detector::WindowChangeDetector::snapshot_without_suppression(
                     prior_front,
+                    pid,
                 )
             } else {
-                crate::window_change_detector::WindowChangeDetector::snapshot(prior_front)
+                crate::window_change_detector::WindowChangeDetector::snapshot(prior_front, pid)
             };
             let result = crate::focus_guard::with_focus_suppressed(
                 (!foreground).then_some(pid),
